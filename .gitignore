@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+
+# 학습 결과물
+results.json
+results.png
+graph_structure.png
+graphnet_model.pt
+
+# Windows
+nul
+Thumbs.db
+
+# 데이터
+/tmp/
+data/
