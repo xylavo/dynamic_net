@@ -334,6 +334,86 @@ class GraphNet(nn.Module):
 
         return new_indices
 
+    def add_edges(self, edge_list: List[Tuple[int, int]], init_std: float = 0.01) -> int:
+        """
+        기존 노드 간 간선 추가.
+
+        Args:
+            edge_list: (src, tgt) 튜플 리스트
+            init_std: 새 가중치 초기화 표준편차
+
+        Returns:
+            실제로 추가된 간선 수
+        """
+        added = 0
+        with torch.no_grad():
+            for src, tgt in edge_list:
+                # 범위 검사
+                if src < 0 or src >= self.n_nodes or tgt < 0 or tgt >= self.n_nodes:
+                    continue
+                # 자기 연결 스킵
+                if src == tgt:
+                    continue
+                # 기존 간선 스킵
+                if self.mask[src, tgt] > 0:
+                    continue
+                # INPUT 노드로 들어오는 간선 스킵
+                if self.node_types[tgt] == self.INPUT:
+                    continue
+                # OUTPUT 노드에서 나가는 간선 스킵
+                if self.node_types[src] == self.OUTPUT:
+                    continue
+                # DAG 제약: src 레벨 < tgt 레벨
+                if self._node_levels[src] >= self._node_levels[tgt]:
+                    continue
+
+                self.mask[src, tgt] = 1.0
+                self.W.data[src, tgt] = torch.randn(1).item() * init_std
+                added += 1
+
+        return added
+
+    def prune_edges(self, threshold: float = 0.001, min_outgoing: int = 1, min_incoming: int = 1) -> int:
+        """
+        가중치 절대값이 임계값 미만인 간선 제거.
+        노드 고립 방지를 위해 최소 incoming/outgoing 간선 수 보장.
+
+        Args:
+            threshold: 이 값 미만의 |W|인 간선을 제거 후보로 선정
+            min_outgoing: 각 비출력 노드가 유지해야 할 최소 outgoing 간선 수
+            min_incoming: 각 비입력 노드가 유지해야 할 최소 incoming 간선 수
+
+        Returns:
+            제거된 간선 수
+        """
+        removed = 0
+        with torch.no_grad():
+            W_abs = (self.W.data * self.mask).abs()
+            N = self.n_nodes
+
+            for src in range(N):
+                for tgt in range(N):
+                    if self.mask[src, tgt] == 0:
+                        continue
+                    if W_abs[src, tgt] >= threshold:
+                        continue
+
+                    # 최소 outgoing 보장: src의 남은 outgoing 간선 수 확인
+                    src_outgoing = int(self.mask[src, :].sum().item())
+                    if src_outgoing <= min_outgoing:
+                        continue
+
+                    # 최소 incoming 보장: tgt의 남은 incoming 간선 수 확인
+                    tgt_incoming = int(self.mask[:, tgt].sum().item())
+                    if tgt_incoming <= min_incoming:
+                        continue
+
+                    self.mask[src, tgt] = 0.0
+                    self.W.data[src, tgt] = 0.0
+                    removed += 1
+
+        return removed
+
     def remove_nodes(self, indices_to_remove: List[int]) -> int:
         """
         HIDDEN 노드를 제거하고 W, mask, bias, node_types를 재구성.
@@ -405,6 +485,55 @@ class GraphNet(nn.Module):
             self.n_outputs / max(n, 1),
         ], dtype=torch.float32)
         return state
+
+    def remove_edges(self, edge_list: List[Tuple[int, int]],
+                     min_outgoing: int = 1, min_incoming: int = 1) -> int:
+        """
+        특정 간선 리스트를 제거 (RL 프루닝 결정용).
+        최소 연결성 보장 (min_outgoing/min_incoming).
+
+        Args:
+            edge_list: (src, tgt) 튜플 리스트
+            min_outgoing: 각 비출력 노드가 유지해야 할 최소 outgoing 간선 수
+            min_incoming: 각 비입력 노드가 유지해야 할 최소 incoming 간선 수
+
+        Returns:
+            실제로 제거된 간선 수
+        """
+        removed = 0
+        with torch.no_grad():
+            for src, tgt in edge_list:
+                if src < 0 or src >= self.n_nodes or tgt < 0 or tgt >= self.n_nodes:
+                    continue
+                if self.mask[src, tgt] == 0:
+                    continue
+
+                # 최소 outgoing 보장
+                src_outgoing = int(self.mask[src, :].sum().item())
+                if src_outgoing <= min_outgoing:
+                    continue
+
+                # 최소 incoming 보장
+                tgt_incoming = int(self.mask[:, tgt].sum().item())
+                if tgt_incoming <= min_incoming:
+                    continue
+
+                self.mask[src, tgt] = 0.0
+                self.W.data[src, tgt] = 0.0
+                removed += 1
+
+        return removed
+
+    def get_node_degrees(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        노드별 (out_degree, in_degree) 반환.
+
+        Returns:
+            (out_degree, in_degree): 각각 (N,) 텐서
+        """
+        out_degree = self.mask.sum(dim=1)
+        in_degree = self.mask.sum(dim=0)
+        return out_degree, in_degree
 
     def _validate_dag(self) -> bool:
         """DAG 제약 조건 검증."""

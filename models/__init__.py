@@ -1,4 +1,4 @@
 from models.dynamic_net import DynamicNet
 from models.graph_net import GraphNet
 from models.neurogenesis_controller import NeurogenesisController, GraphNeurogenesisController
-from models.rl_controller import RLConnectionController
+from models.rl_controller import RLConnectionController, RLEdgeController

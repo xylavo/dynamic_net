@@ -25,6 +25,7 @@ from typing import Dict, List
 from models.dynamic_net import DynamicNet
 from models.graph_net import GraphNet
 from models.neurogenesis_controller import NeurogenesisController, GraphNeurogenesisController
+from models.rl_controller import RLEdgeController
 
 
 # ──────────────────────────────────────────────
@@ -58,8 +59,8 @@ def get_dataloaders(dataset: str = 'mnist', batch_size: int = 256, data_root: st
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, persistent_workers=True)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=4, persistent_workers=True)
 
     return train_loader, test_loader, input_size, n_classes
 
@@ -183,11 +184,12 @@ def run_graphnet_growth(
 
     neuro_ctrl = GraphNeurogenesisController(
         net=net,
-        patience=4,
+        patience=2,
         min_delta=5e-4,
         growth_neurons=16,
-        growth_cooldown=3,
-        top_k_incoming=16,
+        growth_cooldown=1,
+        incoming_k=8,
+        edges_per_epoch=32,
         verbose=verbose,
     )
 
@@ -199,6 +201,8 @@ def run_graphnet_growth(
         'architecture': [],
         'growth_events': [],
         'prune_events': [],
+        'edge_events': [],
+        'edge_prune_events': [],
         'time_per_epoch': [],
     }
 
@@ -230,8 +234,10 @@ def run_graphnet_growth(
                 f"nodes={net.n_nodes} edges={net.n_edges} | {elapsed:.1f}s"
             )
 
-        # 뉴로제네시스 체크 (프루닝 + 성장)
+        # 뉴로제네시스 체크 (프루닝 + 간선 프루닝 + 간선 추가 + 성장)
         old_n_prune = len(neuro_ctrl.prune_events)
+        old_n_edge = len(neuro_ctrl.edge_events)
+        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
         grew = neuro_ctrl.step(val_loss, epoch)
 
         # 프루닝 이벤트 기록
@@ -248,6 +254,26 @@ def run_graphnet_growth(
             optimizer = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
             remaining = max(1, n_epochs - epoch)
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining)
+
+        # 간선 프루닝 이벤트 기록
+        if len(neuro_ctrl.edge_prune_events) > old_n_edge_prune:
+            latest_ep = neuro_ctrl.edge_prune_events[-1]
+            history['edge_prune_events'].append({
+                'epoch': epoch,
+                'n_removed': latest_ep['n_removed'],
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
+
+        # 간선 추가 이벤트 기록
+        if len(neuro_ctrl.edge_events) > old_n_edge:
+            latest_edge = neuro_ctrl.edge_events[-1]
+            history['edge_events'].append({
+                'epoch': epoch,
+                'n_added': latest_edge['n_added'],
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
 
         if grew is not None:
             # 새 파라미터를 옵티마이저에 등록
@@ -267,14 +293,189 @@ def run_graphnet_growth(
     print(f"\n  최종 결과: val_acc={max(history['val_acc']):.4f} | "
           f"nodes={net.n_nodes} | edges={net.n_edges} | params={net.total_params:,}")
     print(f"  성장 이벤트: {len(history['growth_events'])}회 | "
-          f"프루닝 이벤트: {len(history['prune_events'])}회")
+          f"프루닝 이벤트: {len(history['prune_events'])}회 | "
+          f"간선 추가: {len(history['edge_events'])}회 | "
+          f"간선 프루닝: {len(history['edge_prune_events'])}회")
     print(f"  최종 구조: {net}")
 
     return history
 
 
 # ──────────────────────────────────────────────
-# 5. 메인
+# 5. GraphNet-RL 실험
+# ──────────────────────────────────────────────
+def run_graphnet_rl(
+    name: str,
+    net: GraphNet,
+    train_loader,
+    test_loader,
+    device: torch.device,
+    n_epochs: int = 30,
+    verbose: bool = True,
+) -> Dict:
+    print(f"\n{'='*60}")
+    print(f"  실험: {name}")
+    print(f"  초기 구조: {net}")
+    print(f"{'='*60}")
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    rl_ctrl = RLEdgeController(
+        net=net,
+        lr=3e-4,
+        alpha=10.0,
+        beta=0.005,
+        epsilon_start=0.3,
+        epsilon_end=0.05,
+        epsilon_decay_epochs=100,
+        entropy_coeff=0.1,
+        update_every=5,
+        growth_incoming_candidates=48,   # 32→48: 더 많은 incoming 후보
+        growth_outgoing_candidates=16,
+        edge_add_candidates=400,         # 200→400: 간선 추가 후보 2배
+        prune_weight_threshold=0.01,     # 0.05→0.01: 프루닝 임계값 5배 낮춤
+        prune_warmup_epochs=10,          # 처음 10 epoch 프루닝 비활성화
+        verbose=verbose,
+    )
+
+    neuro_ctrl = GraphNeurogenesisController(
+        net=net,
+        patience=2,
+        min_delta=5e-4,
+        growth_neurons=32,               # 16→32: 한번에 더 많은 노드 추가
+        growth_cooldown=1,
+        incoming_k=12,                   # 8→12: 노드당 더 많은 incoming 연결
+        edges_per_epoch=64,              # 32→64: 비RL 경로 간선 추가도 공격적으로
+        verbose=verbose,
+        rl_controller=rl_ctrl,
+    )
+
+    history = {
+        'name': name,
+        'train_loss': [], 'train_acc': [],
+        'val_loss': [], 'val_acc': [],
+        'n_params': [], 'n_nodes': [], 'n_edges': [],
+        'architecture': [],
+        'growth_events': [],
+        'prune_events': [],
+        'edge_events': [],
+        'edge_prune_events': [],
+        'time_per_epoch': [],
+        'rl_policy_loss': [],
+        'rl_avg_connect_prob': [],
+        'rl_epsilon': [],
+    }
+
+    for epoch in range(1, n_epochs + 1):
+        t0 = time.time()
+        train_loss, train_acc = train_epoch(
+            net, train_loader, optimizer, criterion, device,
+            neuro_ctrl=neuro_ctrl,
+        )
+        val_loss, val_acc = evaluate(net, test_loader, criterion, device)
+        scheduler.step()
+        elapsed = time.time() - t0
+
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['n_params'].append(net.total_params)
+        history['n_nodes'].append(net.n_nodes)
+        history['n_edges'].append(net.n_edges)
+        history['architecture'].append(str(net))
+        history['time_per_epoch'].append(elapsed)
+
+        if verbose and epoch % 5 == 0:
+            print(
+                f"  Epoch {epoch:3d}/{n_epochs} | "
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
+                f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
+                f"nodes={net.n_nodes} edges={net.n_edges} | {elapsed:.1f}s"
+            )
+
+        # 뉴로제네시스 체크 (RL 기반 간선 결정 포함)
+        old_n_prune = len(neuro_ctrl.prune_events)
+        old_n_edge = len(neuro_ctrl.edge_events)
+        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
+        grew = neuro_ctrl.step(val_loss, epoch, val_acc=val_acc)
+
+        # 프루닝 이벤트 기록
+        if len(neuro_ctrl.prune_events) > old_n_prune:
+            latest_prune = neuro_ctrl.prune_events[-1]
+            history['prune_events'].append({
+                'epoch': epoch,
+                'n_pruned': latest_prune['n_pruned'],
+                'n_nodes': net.n_nodes,
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
+            optimizer = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+            remaining = max(1, n_epochs - epoch)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining)
+
+        # 간선 프루닝 이벤트 기록
+        if len(neuro_ctrl.edge_prune_events) > old_n_edge_prune:
+            latest_ep = neuro_ctrl.edge_prune_events[-1]
+            history['edge_prune_events'].append({
+                'epoch': epoch,
+                'n_removed': latest_ep['n_removed'],
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
+
+        # 간선 추가 이벤트 기록
+        if len(neuro_ctrl.edge_events) > old_n_edge:
+            latest_edge = neuro_ctrl.edge_events[-1]
+            history['edge_events'].append({
+                'epoch': epoch,
+                'n_added': latest_edge['n_added'],
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
+
+        if grew is not None:
+            optimizer = optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
+            remaining = max(1, n_epochs - epoch)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining)
+
+            history['growth_events'].append({
+                'epoch': epoch,
+                'n_added': grew,
+                'n_nodes': net.n_nodes,
+                'n_edges': net.n_edges,
+                'val_acc': val_acc,
+            })
+
+        # RL 메트릭 기록
+        rl_summary = rl_ctrl.get_summary()
+        history['rl_policy_loss'].append(
+            rl_summary['policy_losses'][-1] if rl_summary['policy_losses'] else 0.0
+        )
+        history['rl_avg_connect_prob'].append(
+            rl_summary['avg_connect_probs'][-1] if rl_summary['avg_connect_probs'] else 0.5
+        )
+        history['rl_epsilon'].append(
+            rl_summary['epsilons'][-1] if rl_summary['epsilons'] else 0.3
+        )
+
+    summary = neuro_ctrl.get_summary()
+    print(f"\n  최종 결과: val_acc={max(history['val_acc']):.4f} | "
+          f"nodes={net.n_nodes} | edges={net.n_edges} | params={net.total_params:,}")
+    print(f"  성장 이벤트: {len(history['growth_events'])}회 | "
+          f"프루닝 이벤트: {len(history['prune_events'])}회 | "
+          f"간선 추가: {len(history['edge_events'])}회 | "
+          f"간선 프루닝: {len(history['edge_prune_events'])}회")
+    print(f"  RL 정책 업데이트: {len(rl_ctrl.policy_losses)}회")
+    print(f"  최종 구조: {net}")
+
+    return history
+
+
+# ──────────────────────────────────────────────
+# 6. 메인
 # ──────────────────────────────────────────────
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -320,6 +521,22 @@ def main():
         n_epochs=n_epochs,
     )
 
+    # ── 실험 3: GraphNet-RL ──
+    graph_net_rl = GraphNet(
+        n_inputs=input_size,
+        n_outputs=n_classes,
+        initial_hidden=0,
+    ).to(device)
+
+    results['GraphNet-RL'] = run_graphnet_rl(
+        name='GraphNet-RL (RL Edge Decisions)',
+        net=graph_net_rl,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        device=device,
+        n_epochs=n_epochs,
+    )
+
     # ── GraphNet 모델 저장 (시각화용) ──
     model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'graphnet_model.pt')
     torch.save({
@@ -339,16 +556,20 @@ def main():
     print("\n" + "="*60)
     print("  최종 비교 요약")
     print("="*60)
-    print(f"{'모델':<30} {'최고 val_acc':>12} {'최종 params':>14} {'성장':>6} {'프루닝':>6}")
-    print("-"*70)
+    print(f"{'모델':<30} {'최고 val_acc':>12} {'최종 params':>14} {'성장':>6} {'프루닝':>6} {'간선+':>6} {'간선-':>6}")
+    print("-"*82)
     for name, hist in results.items():
         prune_count = len(hist.get('prune_events', []))
+        edge_count = len(hist.get('edge_events', []))
+        edge_prune_count = len(hist.get('edge_prune_events', []))
         print(
             f"{name:<30} "
             f"{max(hist['val_acc']):>11.4f} "
             f"{hist['n_params'][-1]:>14,} "
             f"{len(hist['growth_events']):>6} "
-            f"{prune_count:>6}"
+            f"{prune_count:>6} "
+            f"{edge_count:>6} "
+            f"{edge_prune_count:>6}"
         )
 
     # ── 그래프 출력 ──
@@ -358,63 +579,139 @@ def main():
 
 
 def plot_results(results: Dict):
-    """epoch별 val_acc, val_loss, 파라미터 수 비교 그래프."""
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    """epoch별 val_acc, val_loss, 파라미터 수, 노드 수, 간선 수, RL 메트릭 비교 그래프."""
+    # RL 메트릭이 있으면 3x3, 없으면 2x3
+    has_rl = any('rl_policy_loss' in hist for hist in results.values())
+    if has_rl:
+        fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+    else:
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    colors = {'Baseline (Fixed)': 'tab:blue', 'GraphNet-Growth': 'tab:orange', 'GraphNet-RL': 'tab:green'}
 
     # 1) Val Accuracy
-    ax = axes[0]
+    ax = axes[0, 0]
     growth_line_added = False
     prune_line_added = False
     for name, hist in results.items():
+        c = colors.get(name, None)
         epochs = range(1, len(hist['val_acc']) + 1)
-        ax.plot(epochs, hist['val_acc'], label=name, linewidth=2)
-        # 성장 이벤트 표시
+        ax.plot(epochs, hist['val_acc'], label=name, linewidth=2, color=c)
         for ev in hist['growth_events']:
-            ax.axvline(x=ev['epoch'], color='red', linestyle='--', alpha=0.3,
+            ax.axvline(x=ev['epoch'], color='red', linestyle='--', alpha=0.2,
                        label='Growth' if not growth_line_added else '')
             growth_line_added = True
-        # 프루닝 이벤트 표시
         for ev in hist.get('prune_events', []):
-            ax.axvline(x=ev['epoch'], color='blue', linestyle=':', alpha=0.3,
+            ax.axvline(x=ev['epoch'], color='blue', linestyle=':', alpha=0.2,
                        label='Pruning' if not prune_line_added else '')
             prune_line_added = True
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Validation Accuracy')
     ax.set_title('Val Accuracy over Epochs')
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # 2) Val Loss
-    ax = axes[1]
-    growth_line_added = False
-    prune_line_added = False
+    ax = axes[0, 1]
     for name, hist in results.items():
+        c = colors.get(name, None)
         epochs = range(1, len(hist['val_loss']) + 1)
-        ax.plot(epochs, hist['val_loss'], label=name, linewidth=2)
-        for ev in hist['growth_events']:
-            ax.axvline(x=ev['epoch'], color='red', linestyle='--', alpha=0.3,
-                       label='Growth' if not growth_line_added else '')
-            growth_line_added = True
-        for ev in hist.get('prune_events', []):
-            ax.axvline(x=ev['epoch'], color='blue', linestyle=':', alpha=0.3,
-                       label='Pruning' if not prune_line_added else '')
-            prune_line_added = True
+        ax.plot(epochs, hist['val_loss'], label=name, linewidth=2, color=c)
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Validation Loss')
     ax.set_title('Val Loss over Epochs')
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
     # 3) Parameter Count
-    ax = axes[2]
+    ax = axes[0, 2]
     for name, hist in results.items():
+        c = colors.get(name, None)
         epochs = range(1, len(hist['n_params']) + 1)
-        ax.plot(epochs, hist['n_params'], label=name, linewidth=2)
+        ax.plot(epochs, hist['n_params'], label=name, linewidth=2, color=c)
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Parameters')
     ax.set_title('Parameter Count over Epochs')
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
+
+    # 4) Node Count
+    ax = axes[1, 0]
+    for name, hist in results.items():
+        if 'n_nodes' in hist:
+            c = colors.get(name, None)
+            epochs = range(1, len(hist['n_nodes']) + 1)
+            ax.plot(epochs, hist['n_nodes'], label=name, linewidth=2, color=c)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Nodes')
+    ax.set_title('Node Count over Epochs')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 5) Edge Count
+    ax = axes[1, 1]
+    for name, hist in results.items():
+        if 'n_edges' in hist:
+            c = colors.get(name, None)
+            epochs = range(1, len(hist['n_edges']) + 1)
+            ax.plot(epochs, hist['n_edges'], label=name, linewidth=2, color=c)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Edges')
+    ax.set_title('Edge Count over Epochs')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 6) Train vs Val Accuracy (과적합 확인)
+    ax = axes[1, 2]
+    for name, hist in results.items():
+        c = colors.get(name, None)
+        epochs = range(1, len(hist['val_acc']) + 1)
+        ax.plot(epochs, hist['train_acc'], linestyle='--', alpha=0.5, label=f'{name} (train)', color=c)
+        ax.plot(epochs, hist['val_acc'], linewidth=2, label=f'{name} (val)', color=c)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Train vs Val Accuracy')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # RL 메트릭 서브플롯 (3행)
+    if has_rl:
+        # 7) RL Policy Loss
+        ax = axes[2, 0]
+        for name, hist in results.items():
+            if 'rl_policy_loss' in hist:
+                epochs = range(1, len(hist['rl_policy_loss']) + 1)
+                ax.plot(epochs, hist['rl_policy_loss'], label=name, linewidth=2, color=colors.get(name))
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Policy Loss')
+        ax.set_title('RL Policy Loss')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # 8) RL Avg Connect Prob
+        ax = axes[2, 1]
+        for name, hist in results.items():
+            if 'rl_avg_connect_prob' in hist:
+                epochs = range(1, len(hist['rl_avg_connect_prob']) + 1)
+                ax.plot(epochs, hist['rl_avg_connect_prob'], label=name, linewidth=2, color=colors.get(name))
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Avg Connect Prob')
+        ax.set_title('RL Average Connection Probability')
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+        # 9) RL Epsilon
+        ax = axes[2, 2]
+        for name, hist in results.items():
+            if 'rl_epsilon' in hist:
+                epochs = range(1, len(hist['rl_epsilon']) + 1)
+                ax.plot(epochs, hist['rl_epsilon'], label=name, linewidth=2, color=colors.get(name))
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Epsilon')
+        ax.set_title('RL Exploration (Epsilon)')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results.png')
