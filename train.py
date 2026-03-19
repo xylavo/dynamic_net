@@ -214,6 +214,13 @@ def run_graphnet_growth(
         )
         val_loss, val_acc = evaluate(net, test_loader, criterion, device)
         scheduler.step()
+
+        # 뉴로제네시스 체크 (프루닝 + 간선 프루닝 + 간선 추가 + 성장)
+        old_n_prune = len(neuro_ctrl.prune_events)
+        old_n_edge = len(neuro_ctrl.edge_events)
+        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
+        grew = neuro_ctrl.step(val_loss, epoch)
+
         elapsed = time.time() - t0
 
         history['train_loss'].append(train_loss)
@@ -233,12 +240,6 @@ def run_graphnet_growth(
                 f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
                 f"nodes={net.n_nodes} edges={net.n_edges} | {elapsed:.1f}s"
             )
-
-        # 뉴로제네시스 체크 (프루닝 + 간선 프루닝 + 간선 추가 + 성장)
-        old_n_prune = len(neuro_ctrl.prune_events)
-        old_n_edge = len(neuro_ctrl.edge_events)
-        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
-        grew = neuro_ctrl.step(val_loss, epoch)
 
         # 프루닝 이벤트 기록
         if len(neuro_ctrl.prune_events) > old_n_prune:
@@ -376,6 +377,13 @@ def run_graphnet_rl(
         )
         val_loss, val_acc = evaluate(net, test_loader, criterion, device)
         scheduler.step()
+
+        # 뉴로제네시스 체크 (RL 기반 간선 결정 포함)
+        old_n_prune = len(neuro_ctrl.prune_events)
+        old_n_edge = len(neuro_ctrl.edge_events)
+        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
+        grew = neuro_ctrl.step(val_loss, epoch, val_acc=val_acc)
+
         elapsed = time.time() - t0
 
         history['train_loss'].append(train_loss)
@@ -395,12 +403,6 @@ def run_graphnet_rl(
                 f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} | "
                 f"nodes={net.n_nodes} edges={net.n_edges} | {elapsed:.1f}s"
             )
-
-        # 뉴로제네시스 체크 (RL 기반 간선 결정 포함)
-        old_n_prune = len(neuro_ctrl.prune_events)
-        old_n_edge = len(neuro_ctrl.edge_events)
-        old_n_edge_prune = len(neuro_ctrl.edge_prune_events)
-        grew = neuro_ctrl.step(val_loss, epoch, val_acc=val_acc)
 
         # 프루닝 이벤트 기록
         if len(neuro_ctrl.prune_events) > old_n_prune:
@@ -482,28 +484,41 @@ def main():
     print(f"Device: {device}")
 
     dataset = 'mnist'
-    n_epochs = 50
+    n_epochs = 150
 
     train_loader, test_loader, input_size, n_classes = get_dataloaders(dataset)
     print(f"Dataset: {dataset.upper()} | input_size={input_size} | classes={n_classes}")
 
     results = {}
 
-    # ── 실험 1: 고정 MLP 베이스라인 ──
-    baseline_net = DynamicNet(
-        input_size=input_size,
-        hidden_sizes=[64, 64],
-        output_size=n_classes,
-    ).to(device)
+    # ── 실험 1: 고정 MLP 베이스라인 (이전 결과 재사용) ──
+    save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results.json')
+    if os.path.exists(save_path):
+        with open(save_path, 'r') as f:
+            prev_results = json.load(f)
+        if 'Baseline (Fixed)' in prev_results and len(prev_results['Baseline (Fixed)']['val_acc']) > 0:
+            results['Baseline (Fixed)'] = prev_results['Baseline (Fixed)']
+            print("Baseline: 이전 결과 재사용")
+        else:
+            prev_results = None
+    else:
+        prev_results = None
 
-    results['Baseline (Fixed)'] = run_baseline(
-        name='Baseline (Fixed MLP)',
-        net=baseline_net,
-        train_loader=train_loader,
-        test_loader=test_loader,
-        device=device,
-        n_epochs=n_epochs,
-    )
+    if 'Baseline (Fixed)' not in results:
+        baseline_net = DynamicNet(
+            input_size=input_size,
+            hidden_sizes=[64, 64],
+            output_size=n_classes,
+        ).to(device)
+
+        results['Baseline (Fixed)'] = run_baseline(
+            name='Baseline (Fixed MLP)',
+            net=baseline_net,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            device=device,
+            n_epochs=n_epochs,
+        )
 
     # ── 실험 2: GraphNet-Growth ──
     graph_net = GraphNet(

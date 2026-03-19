@@ -356,6 +356,8 @@ class RLEdgeController:
         self._epoch_rewards: List[float] = []
         self._epoch_log_prob_sums: List[torch.Tensor] = []
         self._epoch_entropy_sums: List[torch.Tensor] = []
+        self._epoch_decision_count: int = 0          # 현재 epoch 결정 수
+        self._epoch_n_decisions: List[int] = []       # epoch별 결정 수 기록
 
         # 성능 추적
         self.policy_losses: List[float] = []
@@ -365,11 +367,12 @@ class RLEdgeController:
 
     @property
     def _epsilon(self) -> float:
-        """현재 epsilon (선형 감소)."""
+        """현재 epsilon (주기적 감소: 0.05 도달 시 0.3으로 리셋)."""
         if not self.epsilons:
             return self.epsilon_start
         epoch = len(self.epsilons)
-        frac = min(epoch / max(self.epsilon_decay_epochs, 1), 1.0)
+        cycle_epoch = epoch % max(self.epsilon_decay_epochs, 1)
+        frac = cycle_epoch / max(self.epsilon_decay_epochs, 1)
         return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * frac
 
     @property
@@ -400,7 +403,7 @@ class RLEdgeController:
         self, edges: List[Tuple[int, int]], is_pruning: bool = False
     ) -> torch.Tensor:
         """
-        후보 간선들의 18차원 특징 벡터 일괄 생성.
+        후보 간선들의 18차원 특징 벡터 일괄 생성 (벡터화).
 
         Args:
             edges: (src, tgt) 리스트
@@ -414,35 +417,38 @@ class RLEdgeController:
         N = net.n_nodes
         max_level = max(net._node_levels.max().item(), 1)
         out_degree, in_degree = net.get_node_degrees()
-        graph_state = net.get_graph_state()  # (6,)
+        graph_state = net.get_graph_state().to(device)  # (6,)
 
-        # 활성화 통계가 없으면 0으로 채움
-        act_mean = self._act_mean if self._act_mean is not None else torch.zeros(N)
-        act_var = self._act_var if self._act_var is not None else torch.zeros(N)
+        act_mean = (self._act_mean if self._act_mean is not None else torch.zeros(N)).to(device)
+        act_var = (self._act_var if self._act_var is not None else torch.zeros(N)).to(device)
 
         B = len(edges)
+        src_idx = torch.tensor([s for s, t in edges], dtype=torch.long, device=device)
+        tgt_idx = torch.tensor([t for s, t in edges], dtype=torch.long, device=device)
+
+        # 범위 클램프 (새 노드 인덱스 대비)
+        src_clamped = src_idx.clamp(max=N - 1)
+        tgt_clamped = tgt_idx.clamp(max=N - 1)
+        src_valid = (src_idx < N).float()
+        tgt_valid = (tgt_idx < N).float()
+
         features = torch.zeros(B, 18, device=device)
-
-        for i, (src, tgt) in enumerate(edges):
-            # Edge-local 12차원
-            features[i, 0] = act_mean[src] if src < len(act_mean) else 0.0
-            features[i, 1] = act_var[src] if src < len(act_var) else 0.0
-            features[i, 2] = act_mean[tgt] if tgt < len(act_mean) else 0.0
-            features[i, 3] = act_var[tgt] if tgt < len(act_var) else 0.0
-            features[i, 4] = out_degree[src].item() / max(N, 1)
-            features[i, 5] = in_degree[tgt].item() / max(N, 1)
-            features[i, 6] = net._node_levels[src].item() / max_level
-            features[i, 7] = net._node_levels[tgt].item() / max_level
-            features[i, 8] = (net._node_levels[tgt].item() - net._node_levels[src].item()) / max_level
-            features[i, 9] = 1.0 if net.node_types[src] == net.INPUT else 0.0
-            features[i, 10] = 1.0 if net.node_types[tgt] == net.OUTPUT else 0.0
-            if is_pruning:
-                features[i, 11] = abs(net.W.data[src, tgt].item())
-            else:
-                features[i, 11] = 0.0
-
-            # Global context 6차원
-            features[i, 12:18] = graph_state
+        features[:, 0] = act_mean[src_clamped] * src_valid
+        features[:, 1] = act_var[src_clamped] * src_valid
+        features[:, 2] = act_mean[tgt_clamped] * tgt_valid
+        features[:, 3] = act_var[tgt_clamped] * tgt_valid
+        features[:, 4] = out_degree[src_clamped] * src_valid / max(N, 1)
+        features[:, 5] = in_degree[tgt_clamped] * tgt_valid / max(N, 1)
+        node_levels = net._node_levels.to(device)
+        features[:, 6] = node_levels[src_clamped].float() * src_valid / max_level
+        features[:, 7] = node_levels[tgt_clamped].float() * tgt_valid / max_level
+        features[:, 8] = (node_levels[tgt_clamped].float() - node_levels[src_clamped].float()) * src_valid * tgt_valid / max_level
+        features[:, 9] = (net.node_types[src_clamped] == net.INPUT).float() * src_valid
+        features[:, 10] = (net.node_types[tgt_clamped] == net.OUTPUT).float() * tgt_valid
+        if is_pruning:
+            features[:, 11] = net.W.data[src_clamped, tgt_clamped].abs()
+        # Global context broadcast
+        features[:, 12:18] = graph_state.unsqueeze(0)
 
         return features
 
@@ -450,7 +456,7 @@ class RLEdgeController:
         self, edge_features: torch.Tensor
     ) -> Tuple[List[bool], List[float], torch.Tensor, torch.Tensor]:
         """
-        간선별 연결/유지 결정 샘플링.
+        간선별 연결/유지 결정 샘플링 (벡터화).
 
         Returns:
             decisions: 각 간선의 연결 여부 리스트
@@ -461,46 +467,45 @@ class RLEdgeController:
         if edge_features.shape[0] == 0:
             return [], [], torch.tensor(0.0), torch.tensor(0.0)
 
+        B = edge_features.shape[0]
+        self._epoch_decision_count += B
         connect_probs, scale_logits = self.policy(edge_features)
 
+        # 평균 연결 확률 기록 (배치 단위)
+        self._current_epoch_connect_probs.extend(connect_probs.detach().cpu().tolist())
+
+        # Epsilon-greedy 결정 (벡터)
         epsilon = self._epsilon
-        decisions = []
-        log_probs = []
-        entropies = []
-        scale_values = []
+        explore_mask = torch.rand(B, device=edge_features.device) < epsilon
+        random_decisions = torch.rand(B, device=edge_features.device) < 0.5
+        greedy_decisions = connect_probs > 0.5
+        decisions_t = torch.where(explore_mask, random_decisions, greedy_decisions)
 
-        for i in range(edge_features.shape[0]):
-            p = connect_probs[i]
-            self._current_epoch_connect_probs.append(p.item())
+        # 연결 로그 확률 (벡터)
+        connect_lp = torch.where(
+            decisions_t,
+            torch.log(connect_probs + 1e-8),
+            torch.log(1 - connect_probs + 1e-8),
+        )
 
-            # Epsilon-greedy 탐색
-            if np.random.random() < epsilon:
-                decision = np.random.random() < 0.5
-            else:
-                decision = p.item() > 0.5
+        # 연결 엔트로피 (벡터)
+        connect_ent = -(connect_probs * torch.log(connect_probs + 1e-8)
+                        + (1 - connect_probs) * torch.log(1 - connect_probs + 1e-8))
 
-            # 로그 확률 계산
-            if decision:
-                lp = torch.log(p + 1e-8)
-            else:
-                lp = torch.log(1 - p + 1e-8)
-            log_probs.append(lp)
+        # 스케일 결정 (배치 Categorical)
+        scale_dist = torch.distributions.Categorical(logits=scale_logits)
+        scale_idx = scale_dist.sample()  # (B,)
+        scale_lp = scale_dist.log_prob(scale_idx)  # (B,)
+        scale_ent = scale_dist.entropy()  # (B,)
 
-            # 엔트로피: -p*log(p) - (1-p)*log(1-p)
-            ent = -(p * torch.log(p + 1e-8) + (1 - p) * torch.log(1 - p + 1e-8))
-            entropies.append(ent)
+        scale_values_t = torch.tensor(self.SCALE_VALUES, device=edge_features.device)[scale_idx]
 
-            # 스케일 결정
-            scale_dist = torch.distributions.Categorical(logits=scale_logits[i])
-            scale_idx = scale_dist.sample()
-            log_probs.append(scale_dist.log_prob(scale_idx))
-            entropies.append(scale_dist.entropy())
-            scale_values.append(self.SCALE_VALUES[scale_idx.item()])
+        # 합산
+        log_prob_sum = connect_lp.sum() + scale_lp.sum()
+        entropy_sum = connect_ent.sum() + scale_ent.sum()
 
-            decisions.append(decision)
-
-        log_prob_sum = torch.stack(log_probs).sum()
-        entropy_sum = torch.stack(entropies).sum()
+        decisions = decisions_t.cpu().tolist()
+        scale_values = scale_values_t.cpu().tolist()
 
         return decisions, scale_values, log_prob_sum, entropy_sum
 
@@ -520,8 +525,9 @@ class RLEdgeController:
             (connect_from_list, connect_to_list): 각 노드별 incoming/outgoing 연결
         """
         net = self.net
-        output_indices = (net.node_types == net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
-        non_output_indices = (net.node_types != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+        N = net.n_nodes
+        output_indices = (net.node_types[:N] == net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+        non_output_indices = (net.node_types[:N] != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
 
         connect_from_list = []
         connect_to_list = []
@@ -647,27 +653,49 @@ class RLEdgeController:
             추가할 (src, tgt) 리스트
         """
         net = self.net
-        non_output = (net.node_types != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
-        non_input = (net.node_types != net.INPUT).nonzero(as_tuple=True)[0].tolist()
+        N = net.n_nodes
+        non_output = (net.node_types[:N] != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+        non_input = (net.node_types[:N] != net.INPUT).nonzero(as_tuple=True)[0].tolist()
 
         if not non_output or not non_input:
             return []
 
-        # 랜덤 후보 쌍 생성 (DAG 제약 만족하는 것만)
-        candidates = []
-        attempts = 0
-        max_attempts = self.edge_add_candidates * 3
-        while len(candidates) < self.edge_add_candidates and attempts < max_attempts:
-            src = non_output[np.random.randint(len(non_output))]
-            tgt = non_input[np.random.randint(len(non_input))]
-            attempts += 1
-            if src == tgt:
-                continue
-            if net.mask[src, tgt] > 0:
-                continue
-            if net._node_levels[src] >= net._node_levels[tgt]:
-                continue
-            candidates.append((src, tgt))
+        # 랜덤 후보 쌍 생성 (DAG 제약 만족하는 것만) — 벡터화
+        non_output_t = torch.tensor(non_output, device=net.W.device)
+        non_input_t = torch.tensor(non_input, device=net.W.device)
+        n_samples = self.edge_add_candidates * 3
+
+        src_idx = non_output_t[torch.randint(len(non_output_t), (n_samples,))]
+        tgt_idx = non_input_t[torch.randint(len(non_input_t), (n_samples,))]
+
+        # 필터: src != tgt, 기존 간선 없음, DAG 레벨 유지
+        node_levels = net._node_levels.to(src_idx.device)
+        valid = (src_idx != tgt_idx)
+        valid &= (net.mask[src_idx, tgt_idx] == 0)
+        valid &= (node_levels[src_idx] < node_levels[tgt_idx])
+
+        valid_src = src_idx[valid]
+        valid_tgt = tgt_idx[valid]
+
+        # 중복 제거 후 최대 edge_add_candidates개
+        if valid_src.shape[0] > 0:
+            pairs = valid_src * net.W.shape[0] + valid_tgt
+            unique_mask = torch.zeros(pairs.max().item() + 1, dtype=torch.bool, device=pairs.device)
+            unique_indices = []
+            for i in range(min(pairs.shape[0], self.edge_add_candidates * 2)):
+                p = pairs[i].item()
+                if not unique_mask[p]:
+                    unique_mask[p] = True
+                    unique_indices.append(i)
+                    if len(unique_indices) >= self.edge_add_candidates:
+                        break
+            if unique_indices:
+                idx_t = torch.tensor(unique_indices, device=valid_src.device)
+                candidates = list(zip(valid_src[idx_t].tolist(), valid_tgt[idx_t].tolist()))
+            else:
+                candidates = []
+        else:
+            candidates = []
 
         if not candidates:
             return []
@@ -697,21 +725,17 @@ class RLEdgeController:
             return []
 
         net = self.net
-        N = net.n_nodes
         W_abs = (net.W.data * net.mask).abs()
 
-        # |W| < threshold인 간선만 후보
-        candidates = []
-        for src in range(N):
-            for tgt in range(N):
-                if net.mask[src, tgt] == 0:
-                    continue
-                if W_abs[src, tgt] >= self.prune_weight_threshold:
-                    continue
-                candidates.append((src, tgt))
+        # |W| < threshold인 간선만 후보 (텐서 연산)
+        candidate_mask = (net.mask > 0) & (W_abs < self.prune_weight_threshold)
+        candidate_indices = candidate_mask.nonzero(as_tuple=False)  # (K, 2)
 
-        if not candidates:
+        if candidate_indices.shape[0] == 0:
             return []
+
+        candidates = candidate_indices.tolist()  # [[src, tgt], ...]
+        candidates = [(s, t) for s, t in candidates]
 
         # 특징 벡터 계산
         features = self.compute_edge_features_batch(candidates, is_pruning=True)
@@ -734,6 +758,8 @@ class RLEdgeController:
         max_params = 256 * 256  # 정규화 기준
         param_ratio = n_params / max(max_params, 1)
 
+        n_decisions = max(self._epoch_decision_count, 1)
+
         if self._prev_acc is not None and self._epoch_log_probs:
             delta_acc = val_acc - self._prev_acc
             delta_param_ratio = param_ratio - self._prev_param_ratio
@@ -741,19 +767,21 @@ class RLEdgeController:
 
             self._epoch_rewards.append(reward)
 
-            # 이 epoch의 로그 확률 / 엔트로피 합산
+            # 이 epoch의 로그 확률 / 엔트로피 — 결정 수로 나눠 평균화
             if self._epoch_log_probs:
-                lp_sum = torch.stack(self._epoch_log_probs).sum()
-                ent_sum = torch.stack(self._epoch_entropies).sum()
-                self._epoch_log_prob_sums.append(lp_sum)
-                self._epoch_entropy_sums.append(ent_sum)
+                lp_mean = torch.stack(self._epoch_log_probs).sum() / n_decisions
+                ent_mean = torch.stack(self._epoch_entropies).sum() / n_decisions
+                self._epoch_log_prob_sums.append(lp_mean)
+                self._epoch_entropy_sums.append(ent_mean)
+                self._epoch_n_decisions.append(n_decisions)
         elif self._epoch_log_probs:
             # 첫 epoch: 보상 0으로 기록
             self._epoch_rewards.append(0.0)
-            lp_sum = torch.stack(self._epoch_log_probs).sum()
-            ent_sum = torch.stack(self._epoch_entropies).sum()
-            self._epoch_log_prob_sums.append(lp_sum)
-            self._epoch_entropy_sums.append(ent_sum)
+            lp_mean = torch.stack(self._epoch_log_probs).sum() / n_decisions
+            ent_mean = torch.stack(self._epoch_entropies).sum() / n_decisions
+            self._epoch_log_prob_sums.append(lp_mean)
+            self._epoch_entropy_sums.append(ent_mean)
+            self._epoch_n_decisions.append(n_decisions)
 
         self._prev_acc = val_acc
         self._prev_param_ratio = param_ratio
@@ -770,6 +798,7 @@ class RLEdgeController:
         self._epoch_log_probs.clear()
         self._epoch_entropies.clear()
         self._current_epoch_connect_probs.clear()
+        self._epoch_decision_count = 0
 
     def maybe_update_policy(self, epoch: int) -> Optional[float]:
         """

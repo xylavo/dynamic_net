@@ -292,7 +292,8 @@ class GraphNeurogenesisController:
         Grace period 내 노드는 제외.
         """
         net = self.net
-        hidden_indices = (net.node_types == net.HIDDEN).nonzero(as_tuple=True)[0].tolist()
+        N = net.n_nodes
+        hidden_indices = (net.node_types[:N] == net.HIDDEN).nonzero(as_tuple=True)[0].tolist()
         if not hidden_indices:
             return []
 
@@ -304,32 +305,29 @@ class GraphNeurogenesisController:
         if not eligible:
             return []
 
-        prunable = set()
+        eligible_t = torch.tensor(eligible, dtype=torch.long)
+        prunable_mask = torch.zeros(eligible_t.shape[0], dtype=torch.bool)
 
-        # 활성화 기반 분석 (dead neuron + low variance)
+        # 활성화 기반 분석 (dead neuron + low variance) — 벡터화
         if self._activation_buffer:
             all_acts = torch.cat(self._activation_buffer, dim=0)  # (total_samples, N)
+            eligible_acts = all_acts[:, eligible_t]  # (samples, K)
 
-            for idx in eligible:
-                acts = all_acts[:, idx]
+            # Dead neuron: 전체 활성화 == 0
+            dead = (eligible_acts == 0).all(dim=0)  # (K,)
+            prunable_mask |= dead
 
-                # Dead neuron: 전체 활성화 == 0
-                if (acts == 0).all():
-                    prunable.add(idx)
-                    continue
+            # Low variance
+            var_per = eligible_acts.var(dim=0)  # (K,)
+            prunable_mask |= (var_per < self.prune_var_threshold)
 
-                # Low variance
-                if acts.var().item() < self.prune_var_threshold:
-                    prunable.add(idx)
-
-        # Low contribution: 나가는 간선 가중치 절대값 합
+        # Low contribution: 나가는 간선 가중치 절대값 합 — 벡터화
         W_eff = (net.W.data * net.mask).abs()
-        for idx in eligible:
-            outgoing_sum = W_eff[idx, :].sum().item()
-            if outgoing_sum < self.prune_contrib_threshold:
-                prunable.add(idx)
+        eligible_gpu = eligible_t.to(net.W.device)
+        outgoing_sums = W_eff[eligible_gpu, :].sum(dim=1).cpu()  # (K,)
+        prunable_mask |= (outgoing_sums < self.prune_contrib_threshold)
 
-        return sorted(prunable)
+        return eligible_t[prunable_mask].tolist()
 
     def step(self, val_loss: float, epoch: int, val_acc: float = None) -> Optional[int]:
         """
@@ -497,8 +495,9 @@ class GraphNeurogenesisController:
             )
 
         net = self.net
-        output_indices = (net.node_types == net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
-        non_output_indices = (net.node_types != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+        N = net.n_nodes
+        output_indices = (net.node_types[:N] == net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
+        non_output_indices = (net.node_types[:N] != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
 
         n = self.growth_neurons
         k = min(self.incoming_k, len(non_output_indices))
@@ -519,7 +518,7 @@ class GraphNeurogenesisController:
                 sampled = torch.multinomial(probs, num_samples=k, replacement=False)
                 connect_from_list.append([non_output_indices[s.item()] for s in sampled])
         else:
-            input_indices = (net.node_types == net.INPUT).nonzero(as_tuple=True)[0].tolist()
+            input_indices = (net.node_types[:N] == net.INPUT).nonzero(as_tuple=True)[0].tolist()
             k_in = min(k, len(input_indices))
             connect_from_list = []
             for _ in range(n):
@@ -615,46 +614,48 @@ class GraphNeurogenesisController:
         if not self._activation_buffer:
             return 0
 
-        non_output = (net.node_types != net.OUTPUT).nonzero(as_tuple=True)[0].tolist()
-        non_input = (net.node_types != net.INPUT).nonzero(as_tuple=True)[0].tolist()
+        N = net.n_nodes
+        non_output_t = (net.node_types[:N] != net.OUTPUT).nonzero(as_tuple=True)[0]
+        non_input_t = (net.node_types[:N] != net.INPUT).nonzero(as_tuple=True)[0]
 
-        if not non_output or not non_input:
+        if non_output_t.shape[0] == 0 or non_input_t.shape[0] == 0:
             return 0
 
         all_acts = torch.cat(self._activation_buffer, dim=0)
-        var_per_node = all_acts.var(dim=0)
+        var_per_node = all_acts.var(dim=0).to(net.W.device)
 
-        # 랜덤 후보 쌍 생성
-        n_cand = min(self.edge_candidates, len(non_output) * len(non_input))
-        src_samples = [non_output[torch.randint(len(non_output), (1,)).item()] for _ in range(n_cand)]
-        tgt_samples = [non_input[torch.randint(len(non_input), (1,)).item()] for _ in range(n_cand)]
+        # 벡터화된 랜덤 후보 쌍 생성
+        n_cand = min(self.edge_candidates, non_output_t.shape[0] * non_input_t.shape[0])
+        src_idx = non_output_t[torch.randint(non_output_t.shape[0], (n_cand,))]
+        tgt_idx = non_input_t[torch.randint(non_input_t.shape[0], (n_cand,))]
 
-        # 점수 계산 및 정렬
-        scored = []
-        for s, t in zip(src_samples, tgt_samples):
-            if s == t:
-                continue
-            if net.mask[s, t] > 0:
-                continue
-            if net._node_levels[s] >= net._node_levels[t]:
-                continue
-            score = var_per_node[s].item() * var_per_node[t].item()
-            scored.append((score, s, t))
+        # 벡터화된 필터링
+        node_levels = net._node_levels.to(src_idx.device)
+        valid = (src_idx != tgt_idx)
+        valid &= (net.mask[src_idx, tgt_idx] == 0)
+        valid &= (node_levels[src_idx] < node_levels[tgt_idx])
 
-        if not scored:
+        src_valid = src_idx[valid]
+        tgt_valid = tgt_idx[valid]
+
+        if src_valid.shape[0] == 0:
             return 0
 
-        scored.sort(reverse=True)
-        top_edges = [(s, t) for _, s, t in scored[:self.edges_per_epoch]]
+        # 벡터화된 점수 계산 및 top-K 선택
+        scores = var_per_node[src_valid] * var_per_node[tgt_valid]
+        k = min(self.edges_per_epoch, scores.shape[0])
+        top_k_idx = scores.topk(k).indices
+        top_edges = list(zip(src_valid[top_k_idx].tolist(), tgt_valid[top_k_idx].tolist()))
 
         n_added = net.add_edges(top_edges)
 
         if n_added > 0:
+            n_candidates = src_valid.shape[0]
             event = {
                 'epoch': epoch,
                 'n_added': n_added,
                 'n_edges': net.n_edges,
-                'candidates': len(scored),
+                'candidates': n_candidates,
             }
             self.edge_events.append(event)
             if self.verbose:
@@ -662,7 +663,7 @@ class GraphNeurogenesisController:
                     f"  [EdgeAdd] epoch={epoch} | "
                     f"+{n_added} edges | "
                     f"total_edges: {net.n_edges} | "
-                    f"candidates: {len(scored)}"
+                    f"candidates: {n_candidates}"
                 )
 
         return n_added

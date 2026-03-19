@@ -7,6 +7,7 @@ GraphNet: 가중치 인접 행렬 기반 동적 뉴로제네시스 네트워크
 - mask (N×N 이진 행렬)로 연결 존재 여부를 분리 관리
 - DAG 제약: 위상 순서를 유지하여 순환 방지
 - Forward pass: 위상 정렬 레벨별 행렬 연산으로 GPU 병렬화
+- Capacity-doubling: 텐서를 2배씩 확장하여 리사이징 오버헤드 amortize
 """
 import torch
 import torch.nn as nn
@@ -22,6 +23,9 @@ class GraphNet(nn.Module):
     노드 종류: INPUT(0) | HIDDEN(1) | OUTPUT(2)
     W[i][j] = 노드 i → 노드 j 간선 가중치
     mask[i][j] = 연결 존재 여부
+
+    텐서는 capacity 크기로 할당되고, 실제 노드 수(_n_nodes)만 사용.
+    capacity 부족 시 2배로 확장 (amortized O(1)).
     """
 
     INPUT = 0
@@ -34,6 +38,8 @@ class GraphNet(nn.Module):
         self.n_outputs = n_outputs
 
         n_total = n_inputs + initial_hidden + n_outputs
+        self._n_nodes = n_total
+        self._capacity = n_total
 
         # 노드 종류 추적
         node_types = (
@@ -90,38 +96,76 @@ class GraphNet(nn.Module):
                 std = (2.0 / (n_inputs + n_outputs)) ** 0.5
                 self.W.data[:n_inputs, n_inputs:n_inputs + n_outputs].normal_(0, std)
 
+    def _grow_capacity(self, min_capacity: int):
+        """Capacity를 2배씩 늘려서 min_capacity 이상으로 확장."""
+        new_cap = self._capacity
+        while new_cap < min_capacity:
+            new_cap *= 2
+
+        if new_cap == self._capacity:
+            return
+
+        N = self._n_nodes
+        device = self.W.device
+        dtype = self.W.dtype
+
+        # W 확장
+        new_W = torch.zeros(new_cap, new_cap, device=device, dtype=dtype)
+        new_W[:N, :N] = self.W.data[:N, :N]
+        self.W = nn.Parameter(new_W)
+
+        # mask 확장
+        new_mask = torch.zeros(new_cap, new_cap, device=self.mask.device, dtype=self.mask.dtype)
+        new_mask[:N, :N] = self.mask[:N, :N]
+        self.register_buffer('mask', new_mask)
+
+        # bias 확장
+        new_bias = torch.zeros(new_cap, device=device, dtype=dtype)
+        new_bias[:N] = self.bias.data[:N]
+        self.bias = nn.Parameter(new_bias)
+
+        # node_types 확장 (빈 슬롯은 -1로 초기화하여 INPUT/HIDDEN/OUTPUT과 구분)
+        new_types = torch.full((new_cap,), -1, device=self.node_types.device, dtype=self.node_types.dtype)
+        new_types[:N] = self.node_types[:N]
+        self.register_buffer('node_types', new_types)
+
+        self._capacity = new_cap
+
     @property
     def n_nodes(self) -> int:
-        return self.node_types.shape[0]
+        return self._n_nodes
 
     @property
     def n_hidden(self) -> int:
-        return (self.node_types == self.HIDDEN).sum().item()
+        return int((self.node_types[:self._n_nodes] == self.HIDDEN).sum().item())
 
     @property
     def total_params(self) -> int:
         """유효 파라미터 수: 활성 간선(mask=1) 가중치 + 비입력 노드 바이어스."""
-        n_active_weights = int(self.mask.sum().item())
-        n_biases = int((self.node_types != self.INPUT).sum().item())
+        N = self._n_nodes
+        n_active_weights = int(self.mask[:N, :N].sum().item())
+        n_biases = int((self.node_types[:N] != self.INPUT).sum().item())
         return n_active_weights + n_biases
 
     @property
     def n_edges(self) -> int:
-        return int(self.mask.sum().item())
+        N = self._n_nodes
+        return int(self.mask[:N, :N].sum().item())
 
     def _compute_levels(self):
         """
         Kahn's 알고리즘 변형으로 위상 레벨 계산 (longest path 기반).
         각 노드를 가능한 한 늦은 레벨에 배치하여 정보 전파를 최대화.
         """
-        N = self.n_nodes
-        adj = self.mask.detach()
+        N = self._n_nodes
+        adj = self.mask[:N, :N].detach()
+        node_types = self.node_types[:N]
 
         # longest path 기반 레벨 할당
         level = torch.zeros(N, dtype=torch.long)
 
         # 입력 노드는 레벨 0
-        input_mask = (self.node_types == self.INPUT)
+        input_mask = (node_types == self.INPUT)
         level[input_mask] = 0
 
         # BFS로 longest path 계산
@@ -130,7 +174,7 @@ class GraphNet(nn.Module):
 
         queue = deque()
         for i in range(N):
-            if self.node_types[i] == self.INPUT:
+            if node_types[i] == self.INPUT:
                 queue.append(i)
 
         visited_count = torch.zeros(N, dtype=torch.long)
@@ -172,16 +216,16 @@ class GraphNet(nn.Module):
             x = x.view(x.size(0), -1)
 
         batch_size = x.size(0)
-        N = self.n_nodes
+        N = self._n_nodes
 
-        # 유효 가중치 (마스크 적용)
-        W_eff = self.W * self.mask
+        # 유효 가중치 (마스크 적용, 활성 노드 영역만)
+        W_eff = self.W[:N, :N] * self.mask[:N, :N]
 
         # 모든 노드의 활성화를 저장할 텐서
         h = torch.zeros(batch_size, N, device=x.device, dtype=x.dtype)
 
         # 레벨 0: 입력 노드에 데이터 할당
-        input_indices = (self.node_types == self.INPUT).nonzero(as_tuple=True)[0]
+        input_indices = (self.node_types[:N] == self.INPUT).nonzero(as_tuple=True)[0]
         h[:, input_indices] = x
 
         # 레벨 1부터: 이전 레벨들의 활성화를 기반으로 계산
@@ -206,7 +250,7 @@ class GraphNet(nn.Module):
         self.last_activations = h.detach()
 
         # 출력 노드만 추출
-        output_indices = (self.node_types == self.OUTPUT).nonzero(as_tuple=True)[0]
+        output_indices = (self.node_types[:N] == self.OUTPUT).nonzero(as_tuple=True)[0]
         return h[:, output_indices]
 
     def add_node(
@@ -226,36 +270,19 @@ class GraphNet(nn.Module):
         Returns:
             새 노드의 인덱스
         """
-        old_N = self.n_nodes
-        new_N = old_N + 1
-        new_idx = old_N
+        N = self._n_nodes
+        new_N = N + 1
+        new_idx = N
 
-        # 1) W 확장: (old_N, old_N) → (new_N, new_N)
-        old_W = self.W.data
-        new_W_data = torch.zeros(new_N, new_N, device=old_W.device, dtype=old_W.dtype)
-        new_W_data[:old_N, :old_N] = old_W
-        self.W = nn.Parameter(new_W_data)
+        # Capacity 부족 시 2배 확장
+        if new_N > self._capacity:
+            self._grow_capacity(new_N)
 
-        # 2) mask 확장
-        old_mask = self.mask
-        new_mask = torch.zeros(new_N, new_N, device=old_mask.device, dtype=old_mask.dtype)
-        new_mask[:old_N, :old_N] = old_mask
-        self.register_buffer('mask', new_mask)
+        # 노드 타입 설정
+        self.node_types[new_idx] = self.HIDDEN
+        self._n_nodes = new_N
 
-        # 3) bias 확장
-        old_bias = self.bias.data
-        new_bias_data = torch.zeros(new_N, device=old_bias.device, dtype=old_bias.dtype)
-        new_bias_data[:old_N] = old_bias
-        self.bias = nn.Parameter(new_bias_data)
-
-        # 4) node_types 확장
-        old_types = self.node_types
-        new_types = torch.zeros(new_N, device=old_types.device, dtype=old_types.dtype)
-        new_types[:old_N] = old_types
-        new_types[new_idx] = self.HIDDEN
-        self.register_buffer('node_types', new_types)
-
-        # 5) 연결 설정
+        # 연결 설정
         with torch.no_grad():
             for src in connect_from:
                 self.mask[src, new_idx] = 1.0
@@ -264,7 +291,7 @@ class GraphNet(nn.Module):
                 self.mask[new_idx, tgt] = 1.0
                 self.W.data[new_idx, tgt] = torch.randn(1).item() * init_std
 
-        # 6) 위상 레벨 재계산
+        # 위상 레벨 재계산
         self._compute_levels()
 
         return new_idx
@@ -277,7 +304,8 @@ class GraphNet(nn.Module):
         init_std: float = 0.01,
     ) -> List[int]:
         """
-        여러 노드를 한번에 추가 (배치 확장).
+        여러 노드를 한번에 추가.
+        Capacity 부족 시 2배씩 확장 (amortized O(1)).
 
         Args:
             n: 추가할 노드 수
@@ -288,36 +316,19 @@ class GraphNet(nn.Module):
         Returns:
             새 노드들의 인덱스 리스트
         """
-        old_N = self.n_nodes
-        new_N = old_N + n
-        new_indices = list(range(old_N, new_N))
+        N = self._n_nodes
+        new_N = N + n
+        new_indices = list(range(N, new_N))
 
-        # 1) W 확장
-        old_W = self.W.data
-        new_W_data = torch.zeros(new_N, new_N, device=old_W.device, dtype=old_W.dtype)
-        new_W_data[:old_N, :old_N] = old_W
-        self.W = nn.Parameter(new_W_data)
+        # Capacity 부족 시 2배 확장
+        if new_N > self._capacity:
+            self._grow_capacity(new_N)
 
-        # 2) mask 확장
-        old_mask = self.mask
-        new_mask = torch.zeros(new_N, new_N, device=old_mask.device, dtype=old_mask.dtype)
-        new_mask[:old_N, :old_N] = old_mask
-        self.register_buffer('mask', new_mask)
+        # 노드 타입 설정
+        self.node_types[N:new_N] = self.HIDDEN
+        self._n_nodes = new_N
 
-        # 3) bias 확장
-        old_bias = self.bias.data
-        new_bias_data = torch.zeros(new_N, device=old_bias.device, dtype=old_bias.dtype)
-        new_bias_data[:old_N] = old_bias
-        self.bias = nn.Parameter(new_bias_data)
-
-        # 4) node_types 확장
-        old_types = self.node_types
-        new_types = torch.zeros(new_N, device=old_types.device, dtype=old_types.dtype)
-        new_types[:old_N] = old_types
-        new_types[old_N:new_N] = self.HIDDEN
-        self.register_buffer('node_types', new_types)
-
-        # 5) 연결 설정
+        # 연결 설정
         with torch.no_grad():
             for i, new_idx in enumerate(new_indices):
                 if connect_from_list is not None and i < len(connect_from_list):
@@ -329,7 +340,7 @@ class GraphNet(nn.Module):
                         self.mask[new_idx, tgt] = 1.0
                         self.W.data[new_idx, tgt] = torch.randn(1).item() * init_std
 
-        # 6) 위상 레벨 재계산
+        # 위상 레벨 재계산
         self._compute_levels()
 
         return new_indices
@@ -345,11 +356,12 @@ class GraphNet(nn.Module):
         Returns:
             실제로 추가된 간선 수
         """
+        N = self._n_nodes
         added = 0
         with torch.no_grad():
             for src, tgt in edge_list:
                 # 범위 검사
-                if src < 0 or src >= self.n_nodes or tgt < 0 or tgt >= self.n_nodes:
+                if src < 0 or src >= N or tgt < 0 or tgt >= N:
                     continue
                 # 자기 연결 스킵
                 if src == tgt:
@@ -375,7 +387,7 @@ class GraphNet(nn.Module):
 
     def prune_edges(self, threshold: float = 0.001, min_outgoing: int = 1, min_incoming: int = 1) -> int:
         """
-        가중치 절대값이 임계값 미만인 간선 제거.
+        가중치 절대값이 임계값 미만인 간선 제거 (벡터화).
         노드 고립 방지를 위해 최소 incoming/outgoing 간선 수 보장.
 
         Args:
@@ -386,37 +398,45 @@ class GraphNet(nn.Module):
         Returns:
             제거된 간선 수
         """
-        removed = 0
+        N = self._n_nodes
         with torch.no_grad():
-            W_abs = (self.W.data * self.mask).abs()
-            N = self.n_nodes
+            W_abs = (self.W.data[:N, :N] * self.mask[:N, :N]).abs()
 
-            for src in range(N):
-                for tgt in range(N):
-                    if self.mask[src, tgt] == 0:
-                        continue
-                    if W_abs[src, tgt] >= threshold:
-                        continue
+            # 후보: mask > 0 이고 |W| < threshold
+            candidate_mask = (self.mask[:N, :N] > 0) & (W_abs < threshold)
+            if not candidate_mask.any():
+                return 0
 
-                    # 최소 outgoing 보장: src의 남은 outgoing 간선 수 확인
-                    src_outgoing = int(self.mask[src, :].sum().item())
-                    if src_outgoing <= min_outgoing:
-                        continue
+            # 현재 degree 계산
+            out_degree = self.mask[:N, :N].sum(dim=1)  # (N,)
+            in_degree = self.mask[:N, :N].sum(dim=0)   # (N,)
 
-                    # 최소 incoming 보장: tgt의 남은 incoming 간선 수 확인
-                    tgt_incoming = int(self.mask[:, tgt].sum().item())
-                    if tgt_incoming <= min_incoming:
-                        continue
+            # 후보 간선의 (src, tgt) 인덱스
+            candidates = candidate_mask.nonzero(as_tuple=False)  # (K, 2)
 
-                    self.mask[src, tgt] = 0.0
-                    self.W.data[src, tgt] = 0.0
-                    removed += 1
+            # |W|가 작은 순서대로 정렬 (가장 약한 간선부터 제거)
+            cand_weights = W_abs[candidates[:, 0], candidates[:, 1]]
+            sorted_idx = cand_weights.argsort()
+            candidates = candidates[sorted_idx]
+
+            removed = 0
+            for i in range(candidates.shape[0]):
+                s, t = candidates[i, 0].item(), candidates[i, 1].item()
+                if out_degree[s] <= min_outgoing:
+                    continue
+                if in_degree[t] <= min_incoming:
+                    continue
+                self.mask[s, t] = 0.0
+                self.W.data[s, t] = 0.0
+                out_degree[s] -= 1
+                in_degree[t] -= 1
+                removed += 1
 
         return removed
 
     def remove_nodes(self, indices_to_remove: List[int]) -> int:
         """
-        HIDDEN 노드를 제거하고 W, mask, bias, node_types를 재구성.
+        HIDDEN 노드를 제거. 기존 capacity 내에서 compact (재할당 없음).
 
         Args:
             indices_to_remove: 제거할 HIDDEN 노드 인덱스 리스트
@@ -427,45 +447,53 @@ class GraphNet(nn.Module):
         if not indices_to_remove:
             return 0
 
+        N = self._n_nodes
+
         # HIDDEN 노드만 제거 가능
         indices_to_remove = [
             i for i in indices_to_remove
-            if self.node_types[i] == self.HIDDEN
+            if i < N and self.node_types[i] == self.HIDDEN
         ]
         if not indices_to_remove:
             return 0
 
         remove_set = set(indices_to_remove)
-        old_N = self.n_nodes
-        keep_indices = [i for i in range(old_N) if i not in remove_set]
+        keep_indices = [i for i in range(N) if i not in remove_set]
         new_N = len(keep_indices)
 
-        if new_N == old_N:
+        if new_N == N:
             return 0
 
         keep_idx = torch.tensor(keep_indices, device=self.W.device, dtype=torch.long)
 
-        # W 재구성: keep 행/열만 추출
-        new_W_data = self.W.data[keep_idx][:, keep_idx].clone()
-        self.W = nn.Parameter(new_W_data)
+        with torch.no_grad():
+            # 유지할 데이터 추출 (clone으로 안전하게 복사)
+            kept_W = self.W.data[keep_idx][:, keep_idx].clone()
+            kept_mask = self.mask[keep_idx][:, keep_idx].clone()
+            kept_bias = self.bias.data[keep_idx].clone()
+            kept_types = self.node_types[keep_idx].clone()
 
-        # mask 재구성
-        new_mask = self.mask[keep_idx][:, keep_idx].clone()
-        self.register_buffer('mask', new_mask)
+            # Compact: 앞쪽에 데이터 배치, 나머지 영역 0으로 초기화
+            self.W.data[:new_N, :new_N] = kept_W
+            self.W.data[new_N:, :] = 0
+            self.W.data[:new_N, new_N:] = 0
 
-        # bias 재구성
-        new_bias_data = self.bias.data[keep_idx].clone()
-        self.bias = nn.Parameter(new_bias_data)
+            self.mask[:new_N, :new_N] = kept_mask
+            self.mask[new_N:, :] = 0
+            self.mask[:new_N, new_N:] = 0
 
-        # node_types 재구성
-        new_types = self.node_types[keep_idx].clone()
-        self.register_buffer('node_types', new_types)
+            self.bias.data[:new_N] = kept_bias
+            self.bias.data[new_N:] = 0
+
+        self.node_types[:new_N] = kept_types
+        self.node_types[new_N:] = -1
+
+        self._n_nodes = new_N
 
         # 위상 레벨 재계산
         self._compute_levels()
 
-        n_removed = old_N - new_N
-        return n_removed
+        return N - new_N
 
     def get_graph_state(self) -> torch.Tensor:
         """
@@ -474,7 +502,7 @@ class GraphNet(nn.Module):
         Returns:
             (6,) tensor: [n_nodes_norm, n_hidden_norm, n_edges_norm, density, avg_level, max_level]
         """
-        n = self.n_nodes
+        n = self._n_nodes
         max_possible_edges = n * (n - 1)
         state = torch.tensor([
             self.n_hidden / max(n, 1),
@@ -500,21 +528,22 @@ class GraphNet(nn.Module):
         Returns:
             실제로 제거된 간선 수
         """
+        N = self._n_nodes
         removed = 0
         with torch.no_grad():
             for src, tgt in edge_list:
-                if src < 0 or src >= self.n_nodes or tgt < 0 or tgt >= self.n_nodes:
+                if src < 0 or src >= N or tgt < 0 or tgt >= N:
                     continue
                 if self.mask[src, tgt] == 0:
                     continue
 
                 # 최소 outgoing 보장
-                src_outgoing = int(self.mask[src, :].sum().item())
+                src_outgoing = int(self.mask[src, :N].sum().item())
                 if src_outgoing <= min_outgoing:
                     continue
 
                 # 최소 incoming 보장
-                tgt_incoming = int(self.mask[:, tgt].sum().item())
+                tgt_incoming = int(self.mask[:N, tgt].sum().item())
                 if tgt_incoming <= min_incoming:
                     continue
 
@@ -531,28 +560,30 @@ class GraphNet(nn.Module):
         Returns:
             (out_degree, in_degree): 각각 (N,) 텐서
         """
-        out_degree = self.mask.sum(dim=1)
-        in_degree = self.mask.sum(dim=0)
+        N = self._n_nodes
+        out_degree = self.mask[:N, :N].sum(dim=1)
+        in_degree = self.mask[:N, :N].sum(dim=0)
         return out_degree, in_degree
 
     def _validate_dag(self) -> bool:
         """DAG 제약 조건 검증."""
-        N = self.n_nodes
-        adj = self.mask.detach()
+        N = self._n_nodes
+        adj = self.mask[:N, :N].detach()
+        node_types = self.node_types[:N]
 
         # 자기 연결 금지
         if adj.diag().sum() > 0:
             return False
 
         # 입력→입력 연결 금지
-        input_nodes = (self.node_types == self.INPUT).nonzero(as_tuple=True)[0]
+        input_nodes = (node_types == self.INPUT).nonzero(as_tuple=True)[0]
         for i in input_nodes:
             for j in input_nodes:
                 if adj[i, j] > 0:
                     return False
 
         # 출력 노드에서 나가는 연결 금지
-        output_nodes = (self.node_types == self.OUTPUT).nonzero(as_tuple=True)[0]
+        output_nodes = (node_types == self.OUTPUT).nonzero(as_tuple=True)[0]
         for o in output_nodes:
             if adj[o].sum() > 0:
                 return False
